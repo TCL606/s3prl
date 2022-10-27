@@ -1,5 +1,5 @@
 """
-    Distiller_kldiv Model
+    Distiller_Fbank Model
     Author: Changli Tang (https://github.com/TCL606)
 """
 
@@ -90,7 +90,12 @@ class DistillerBuilder(nn.Module):
 
     def _forward(self, x, x_len, get_hidden=False, no_pred=False):
         wave, pad_mask = self.process_input_data(x, x_len)
-        x = self.model(wave, pad_mask, get_hidden=get_hidden, no_pred=no_pred)
+        wave_num = len(x_len)
+        wave_len = torch.zeros([1, wave_num])
+        for i in range(wave_num):
+            wave_len[i] = x_len[i]
+        wave_len = wave_len.int()
+        x = self.model(wave, wave_len, pad_mask, get_hidden=get_hidden, no_pred=no_pred)
 
         # x: (feat, feat_final, pred, pad_mask)
         return x

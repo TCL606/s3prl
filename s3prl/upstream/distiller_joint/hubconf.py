@@ -1,5 +1,5 @@
 """
-    Distiller_kldiv Model
+    Distiller_JOINT Model
     Author: Changli Tang (https://github.com/TCL606)
 """
 
@@ -164,9 +164,3 @@ def distill_hubert_type2_no_tau(*args, **kwargs):
     ckpt="/mnt/lustre/sjtu/home/xc915/superb/wyj-s3prl/s3prl/result/pretrain/distill_hubert_type2_no_tau/states-epoch-1.ckpt"
     print("Use distill_hubert_type2_no_tau model")
     return distiller_local(ckpt=ckpt)
-
-
-def distill_fithubert_new_type2(*args, **kwargs):
-    ckpt = '/mnt/lustre/sjtu/home/xc915/superb/wyj-s3prl/s3prl/result/pretrain/distill_fithubert_new_type2/states-epoch-1.ckpt'
-    return distiller_local(ckpt=ckpt)
-    

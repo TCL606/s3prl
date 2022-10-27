@@ -1,5 +1,5 @@
 """
-    Distiller_kldiv Model
+    Distiller_Fbank Model
     Author: Changli Tang (https://github.com/TCL606)
 """
 

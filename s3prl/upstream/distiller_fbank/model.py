@@ -1,8 +1,10 @@
 """
-    Distiller_kldiv Model
+    Distiller_Fbank Model
     Author: Changli Tang (https://github.com/TCL606)
 """
 
+import string
+from xmlrpc.client import Boolean
 import torch
 from torch import nn
 import logging
@@ -13,11 +15,13 @@ from .module import (
     ConvFeatureExtractionModel,
     GradMultiply,
 )
-
+import time
 import os
+import numpy as np
+from fairseq.data.audio.audio_utils import _get_torchaudio_fbank, _get_kaldi_fbank
+from fairseq.models.speech_recognition import Conv1dSubsampler
 
 logger = logging.getLogger(__name__)
-
 
 class DistillerConfig:
     """
@@ -39,6 +43,21 @@ class DistillerConfig:
         # Convolutional relative positional encoding
         self.conv_pos = int(config.get("conv_pos", 128))
         self.conv_pos_groups = int(config.get("conv_pos_groups", 16))
+        
+        # fbank subsampler
+        self.conv_channels = int(config.get("conv_channels", 512))
+        self.conv_kernel_sizes = str(
+            config.get("conv_kernel_sizes", '5')
+        )
+        
+        # specaug config
+        self.specaug = bool(config.get("specaug", False))
+        self.freq_mask_F = int(config.get("freq_mask_F", 30))
+        self.freq_mask_N = int(config.get("freq_mask_N", 2))
+        self.time_mask_N = int(config.get("time_mask_N", 2))
+        self.time_mask_T = int(config.get("time_mask_T", 40))
+        self.time_mask_p = float(config.get("time_mask_p", 1.0))
+        self.time_wrap_W = int(config.get("time_wrap_W", 0))
 
         # Transformer encoder
         self.encoder_layers = int(config.get("encoder_layers", 1))
@@ -73,6 +92,8 @@ class DistillerConfig:
         self.hidden_loss = float(config.get("hidden_loss", 0.0))
         self.attn_loss = float(config.get("attn_loss", 0.0))
         self.embedding_loss = float(config.get("embedding_loss", 0.0))
+        self.frontend_loss = float(config.get("frontend_loss", 0.0))
+        self.frontend_steps = int(config.get("frontend_steps", 0))
         self.temperature = float(config.get("temperature", 1.0))
         self.use_temperature = bool(config.get("use_temperature", True))
 
@@ -134,12 +155,14 @@ class DistillerModel(nn.Module):
 
         self.conv_layers = eval(config.extractor_conv_feature_layers)
         feat_emb_dim = self.conv_layers[-1][0]
-        self.feature_extractor = ConvFeatureExtractionModel(
-            self.conv_layers,
-            dropout=config.extractor_dropout,
-            mode=config.extractor_mode,
-            conv_bias=False,
-        )
+        
+        # self.feature_extractor = ConvFeatureExtractionModel(
+        #     self.conv_layers,
+        #     dropout=config.extractor_dropout,
+        #     mode=config.extractor_mode,
+        #     conv_bias=False,
+        # )
+        
         self.feature_grad_mult = config.feature_grad_mult
 
         self.n_tasks = config.n_tasks
@@ -185,17 +208,26 @@ class DistillerModel(nn.Module):
         else:
             raise NotImplementedError(f"Unknown task emb type {self.task_emb_type}")
 
-        self.post_extract_proj = (
-            nn.Linear(feat_emb_dim, config.encoder_embed_dim)
-            if feat_emb_dim != config.encoder_embed_dim
-            else None
-        )
+        self.post_extract_proj = None
+        # (
+        #     nn.Linear(feat_emb_dim, config.encoder_embed_dim)
+        #     if feat_emb_dim != config.encoder_embed_dim
+        #     else None
+        # )
 
         if config.encoder_layers > 0:
             self.encoder = TransformerEncoder(config)
         else:
             self.encoder = nn.GELU()
-
+        
+        self.feature_extractor = FbankExtractor(
+            self.config.conv_channels,
+            self.config.encoder_embed_dim, 
+            self.config.conv_kernel_sizes, 
+            self.config.dropout,
+            self.config.specaug,
+            self.encoder
+        )
         final_dim = config.final_dim * (
             1 if self.task_emb_type != "expand-last" else self.n_tasks
         )
@@ -221,31 +253,36 @@ class DistillerModel(nn.Module):
             ])
         else:
             raise NotImplementedError(f"Unknown out layer type {config.out_layer_type}")
+        
+        if config.frontend_loss > 0:
+            self.frontend_proj = nn.Linear(final_emb_size, config.teacher_final_dim)
+        else:
+            self.frontend_proj = None
 
         if config.projection_type == 'type1' or config.projection_type == 'type3':
-            self.final_proj = nn.Linear(config.encoder_embed_dim, 256)
+            self.final_proj = nn.Linear(config.final_dim, 256)
         elif config.projection_type == 'type2':
-            self.final_proj = nn.Linear(config.encoder_embed_dim, 504)
+            self.final_proj = nn.Linear(config.final_dim, 504)
         else:
-            self.final_proj = nn.Linear(config.encoder_embed_dim, 500)
+            self.final_proj = nn.Linear(config.final_dim, 500)
 
-    def forward_feature(self, wave, pad_mask):
+    def forward_feature(self, wave, wave_len, pad_mask):
         """Forward feature extractor"""
 
         if self.feature_grad_mult > 0:
-            feat = self.feature_extractor(wave)
+            feat, enc_out_len = self.feature_extractor(wave, wave_len) # [770, 12, 768]
             if self.feature_grad_mult != 1.0:
                 feat = GradMultiply.apply(feat, self.feature_grad_mult)
         else:
             with torch.no_grad():
-                feat = self.feature_extractor(wave)
+                feat, enc_out_len = self.feature_extractor(wave, wave_len)
 
-        feat = feat.transpose(1, 2)  # B x T x D
+        feat = feat.transpose(0, 1)  # B x T x D
         pad_mask = self.cal_pad_mask(pad_mask, feat.shape[1])
 
         return feat, pad_mask
 
-    def forward(self, wave, pad_mask, task_id=None, get_hidden=False, no_pred=False): #! to get the output of distill model
+    def forward(self, wave, wave_len, pad_mask, task_id=None, get_hidden=False, no_pred=False): #! to get the output of distill model
         """
         Forward function
         Input:
@@ -254,7 +291,7 @@ class DistillerModel(nn.Module):
             task_id (LongTensor): N >= 1
         """
 
-        feat, pad_mask = self.forward_feature(wave, pad_mask) #! only feature extractor
+        feat, pad_mask = self.forward_feature(wave, wave_len, pad_mask) #! only feature extractor
 
         if self.task_emb_type not in ["none", "expand-last", "self-hidden", "layer-wise"]:
             if task_id is None:
@@ -290,7 +327,7 @@ class DistillerModel(nn.Module):
             if self.post_extract_proj is not None:
                 feat_final = self.post_extract_proj(feat)
             else:
-                feat_final = feat
+                feat_final = feat.clone()
             feat_final = feat_final.unsqueeze(1)
         # feat_final: B x N x T x D or B x 1 x T x D
 
@@ -304,7 +341,7 @@ class DistillerModel(nn.Module):
             get_hidden_tmp = (
                 True if (self.task_emb_type == "self-hidden") else get_hidden
             )
-            hidden, layer_hiddens, attn_hiddens = self.encoder( #! encoder layer(only 2 layers)
+            hidden, layer_hiddens, attn_hiddens = self.encoder(
                 feat_final, ~pad_mask.bool(), get_hidden=True
             ) #! hidden [12,752,768]
         else:
@@ -336,7 +373,10 @@ class DistillerModel(nn.Module):
             pred = torch.stack(pred, dim=1)
 
         embeddings = self.get_embeddings(hidden) # B x T x E
-
+        
+        if self.frontend_proj is not None:
+            feat = self.frontend_proj(feat)
+         
         if get_hidden:
             return feat, feat_final, pred, pad_mask, layer_hiddens, embeddings
         
@@ -364,3 +404,81 @@ class DistillerModel(nn.Module):
     def get_embeddings(self, x):
         return self.final_proj(x)
 
+class FbankExtractor(nn.Module):
+    def __init__(self, conv_channels, encoder_embed_dim, conv_kernel_sizes, dropout, specaug, encoder) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.specaug = specaug
+        self.subsample = Conv1dSubsampler(
+            80,
+            conv_channels,
+            encoder_embed_dim,
+            [int(k) for k in conv_kernel_sizes.split(",")] 
+        )
+        self.linear = torch.nn.Linear(encoder_embed_dim, encoder_embed_dim)
+        nn.init.xavier_normal_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+        self.dropout = torch.nn.Dropout(dropout)
+        
+        # global cmvn
+        stats_npz_path = "/mnt/lustre/sjtu/home/xc915/superb/wyj-s3prl/s3prl/util/global_cmvn.npy"
+        stats = np.load(stats_npz_path, allow_pickle=True).tolist()
+        self.mean, self.std = stats["mean"], stats["std"]
+        
+        # specaug
+        if specaug:
+            specaug_config = {"freq_mask_F": 30, "freq_mask_N": 2, "time_mask_N": 2, "time_mask_T": 40, "time_mask_p": 1.0, "time_wrap_W": 0}
+            from fairseq.data.audio.feature_transforms.specaugment import SpecAugmentTransform
+            self.specaug_transform = SpecAugmentTransform.from_config_dict(specaug_config)
+            logger.info(f"Train with specaug")
+        else:
+            logger.info(f"Train without specaug")
+        
+    def forward(self, source, src_lengths):
+        return self.extract_fbank_features(source, src_lengths, self.encoder.training)
+
+    def extract_fbank_features(self, source, src_lengths, apply_specaug):
+        sample_rate = 16000
+        n_mel_bins = 80
+
+        fbank_lengths = []
+        fbank_features = []
+        data_dtype = source.dtype
+        with torch.no_grad():
+            source = source.float()
+            for batch_idx in range(source.size(0)):
+                _waveform = source[batch_idx][:src_lengths[batch_idx]]
+                _waveform = _waveform * (2 ** 15)
+                _waveform = _waveform.float().cpu().unsqueeze(0).numpy()
+                features = _get_kaldi_fbank(_waveform, sample_rate, n_mel_bins)
+                if features is None:
+                    features = _get_torchaudio_fbank(_waveform, sample_rate, n_mel_bins)
+
+                features = torch.from_numpy(features)
+                features = np.subtract(features, self.mean)
+                features = np.divide(features, self.std)
+                features = features.cuda()
+
+                feat_len = features.size(0)
+                if batch_idx == 0:
+                    max_len  = feat_len
+                else:
+                    if feat_len != max_len:
+                        pad_len = max_len - feat_len
+                        features_padding = features.new(pad_len, n_mel_bins).fill_(0)
+                        features = torch.cat([features, features_padding], dim=0)
+                        features = features.type(source.dtype)
+                # only apply specaug during Training
+                if apply_specaug is True and self.specaug:
+                    features = self.specaug_transform(features)
+
+                fbank_features.append(features)
+                fbank_lengths.append(feat_len)
+
+            fbank_features = torch.stack(fbank_features, dim=0).contiguous().type(data_dtype)
+            fbank_lengths = torch.Tensor(fbank_lengths).int().cuda()
+
+        fbank_features, encoder_out_lengths = self.subsample(fbank_features, src_lengths=fbank_lengths)
+        fbank_features = self.linear(fbank_features)
+        fbank_features = self.dropout(fbank_features)
+        return fbank_features, encoder_out_lengths

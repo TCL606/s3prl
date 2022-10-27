@@ -1,5 +1,5 @@
 """
-    Distiller_kldiv Model
+    Distiller_JOINT Model
     Author: Changli Tang (https://github.com/TCL606)
 """
 
@@ -85,6 +85,9 @@ class DistillerConfig:
         )
 
         # Initialization
+        self.init_model = str(
+            config.get("init_model", "regression")
+        )
         self.init_teacher_conv_layers = bool(
             config.get("init_teacher_conv_layers", False)
         )

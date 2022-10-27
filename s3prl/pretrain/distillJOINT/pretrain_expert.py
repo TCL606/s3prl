@@ -1,5 +1,5 @@
 """
-    Distiller_kldiv Model
+    Distiller_Joint Model
     Author: Changli Tang (https://github.com/TCL606)
 """
 
@@ -10,12 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pretrain.distiller.dataset import OnlineWaveDataset
-from upstream.distiller.model import DistillerConfig, DistillerModel
+from upstream.distiller_joint.model import DistillerConfig, DistillerModel
 import math
 import wandb
 import logging
 import editdistance
-import wandb
 from argparse import Namespace
 
 from fairseq.data.dictionary import Dictionary
@@ -205,46 +204,50 @@ class DistillerForPretrain(nn.Module):
         logger.info("[DistillerModel] - The structure of distiller model")
         logger.info(self.distiller)
 
-        self.teacher_config = teacher_config
+        self.teachers_config = teacher_config
         # teacher = torch.hub.load("s3prl/s3prl", teacher_config.model) #! get the teacher model
 
         #! get the model locally
-        if teacher_config.model.find("wav2vec2") >= 0:
-            logger.info("[DistillerForPretrain] - use wav2vec2 as teacher model")
-            from upstream.wav2vec2.expert import UpstreamExpert
-            teacher = UpstreamExpert(teacher_config.model_path)
-        elif teacher_config.model.find("data2vec") >= 0:
-            logger.info("[DistillerForPretrain] - use data2vec as teacher model")
-            from upstream.data2vec.expert import UpstreamExpert
-            teacher = UpstreamExpert(teacher_config.model_path)
+        if teacher_config.model1.model.find("hubert") >= 0 and teacher_config.model2.model.find("data2vec") >= 0:
+            logger.info("[DistillerForPretrain] - use hubert as disc_teacher model")
+            from upstream.hubert.expert import UpstreamExpert as HubertExpert
+            disc_teacher = HubertExpert(teacher_config.model1.model_path)
+            logger.info("[DistillerForPretrain] - use data2vec as reg_teacher model")
+            from upstream.data2vec.expert import UpstreamExpert as Data2vecExpert
+            reg_teacher = Data2vecExpert(teacher_config.model2.model_path)
         else:
-            logger.info("[DistillerForPretrain] - use hubert as teacher model")
-            from upstream.hubert.expert import UpstreamExpert
-            teacher = UpstreamExpert(teacher_config.model_path)
-        logger.info(teacher.model)
+            raise Exception("Invalid teacher models!")
+            # logger.info("[DistillerForPretrain] - use hubert as teacher model")
+            # from upstream.hubert.expert import UpstreamExpert
+            # teacher = UpstreamExpert(teacher_config.model_path)
+        # logger.info(teacher.model)
 
-        if (
-            teacher_config.model.find("hubert") >= 0
-            or teacher_config.model.find("wav2vec2") >= 0
-            or teacher_config.model.find("data2vec") >= 0
-        ):
-            teacher.model.encoder.layerdrop = 0
-            logger.info("[DistillerForPretrain] - Disabled teacher's encoder layerdrop")
+        # if (
+        #     teacher_config.model.find("hubert") >= 0
+        #     or teacher_config.model.find("wav2vec2") >= 0
+        #     or teacher_config.model.find("data2vec") >= 0
+        # ):
+        disc_teacher.model.encoder.layerdrop = 0
+        reg_teacher.model.encoder.layerdrop = 0
+        logger.info("[DistillerForPretrain] - Disabled teacher's encoder layerdrop")
 
         # if(teacher_config.model.find("data2vec") >= 0):
         #     logger.info(teacher.model.state_dict)
         #     teacher.model.cfg.task.normalize = False
 
-        assert self.distiller.n_tasks <= teacher_config.n_layers, (
+        assert self.distiller.n_tasks <= teacher_config.model1.n_layers, (
             self.distiller.n_tasks,
-            teacher_config.n_layers,
+            teacher_config.model1.n_layers,
         )
-        self.teacher = teacher
-        freeze_model(self.teacher)
+        self.disc_teacher = disc_teacher
+        freeze_model(self.disc_teacher)
+        self.reg_teacher = reg_teacher
+        freeze_model(self.reg_teacher)
 
         logger.info(
-            "[DistillerForPretrain] - Using {} as teacher with {} layers".format(
-                teacher_config.model, teacher_config.n_layers
+            "[DistillerForPretrain] - Using {} as teacher with {} layers, Using {} as teacher with {} layers".format(
+                teacher_config.model1.model, teacher_config.model1.n_layers,
+                teacher_config.model2.model, teacher_config.model2.n_layers
             )
         )
 
@@ -280,31 +283,64 @@ class DistillerForPretrain(nn.Module):
 
         #! copy value from teacher
         if config.init_teacher_conv_layers:
-            logger.info(
-                "[DistillerForPretrain] - "
-                "Initializing feature extractor from teacher"
-            )
-            self.distiller.feature_extractor.load_state_dict(
-                self.teacher.model.feature_extractor.state_dict(),strict=False
-            )
-            if self.distiller.post_extract_proj is not None and self.distiller.post_extract_proj.weight.shape == self.teacher.model.post_extract_proj.weight.shape and self.distiller.post_extract_proj.bias.shape == self.teacher.model.post_extract_proj.bias.shape:
-                self.distiller.post_extract_proj.load_state_dict(
-                    self.teacher.model.post_extract_proj.state_dict()
+            if config.init_model == 'regression':  # model
+                logger.info(
+                    "[DistillerForPretrain] - "
+                    "Initializing feature extractor from reg_teacher"
                 )
+                self.distiller.feature_extractor.load_state_dict(
+                    self.reg_teacher.model.feature_extractor.state_dict(),strict=False
+                )
+                if self.distiller.post_extract_proj is not None and \
+                   self.distiller.post_extract_proj.weight.shape == self.reg_teacher.model.post_extract_proj.weight.shape and \
+                   self.distiller.post_extract_proj.bias.shape == self.reg_teacher.model.post_extract_proj.bias.shape:
+                    self.distiller.post_extract_proj.load_state_dict(
+                        self.reg_teacher.model.post_extract_proj.state_dict()
+                    )
+            elif config.init_model == 'discrimination':
+                logger.info(
+                    "[DistillerForPretrain] - "
+                    "Initializing feature extractor from disc_teacher"
+                )
+                self.distiller.feature_extractor.load_state_dict(
+                    self.disc_teacher.model.feature_extractor.state_dict(),strict=False
+                )
+                if self.distiller.post_extract_proj is not None and \
+                   self.distiller.post_extract_proj.weight.shape == self.disc_teacher.model.post_extract_proj.weight.shape and \
+                   self.distiller.post_extract_proj.bias.shape == self.disc_teacher.model.post_extract_proj.bias.shape:
+                    self.distiller.post_extract_proj.load_state_dict(
+                        self.disc_teacher.model.post_extract_proj.state_dict()
+                    )
+            else:
+                raise Exception("Invalid init model type!")
 
         if config.init_teacher_encoder_layers:
-            logger.info("[DistillerForPretrain] - " "Initializing encoder from teacher")
-            self.distiller.encoder.pos_conv.load_state_dict(
-                self.teacher.model.encoder.pos_conv.state_dict(),strict=False
-            )
-            for l in range(config.encoder_layers): #! 2
-                self.distiller.encoder.layers[l].load_state_dict(
-                    self.teacher.model.encoder.layers[l].state_dict()
+            if config.init_model == 'regression':
+                logger.info("[DistillerForPretrain] - " "Initializing encoder from reg_teacher")
+                self.distiller.encoder.pos_conv.load_state_dict(
+                    self.reg_teacher.model.encoder.pos_conv.state_dict(),strict=False
                 )
+                for l in range(config.encoder_layers): 
+                    self.distiller.encoder.layers[l].load_state_dict(
+                        self.reg_teacher.model.encoder.layers[l].state_dict()
+                    )
+            elif config.init_model == 'discrimination':
+                logger.info("[DistillerForPretrain] - " "Initializing encoder from disc_teacher")
+                self.distiller.encoder.pos_conv.load_state_dict(
+                    self.disc_teacher.model.encoder.pos_conv.state_dict(),strict=False
+                )
+                for l in range(config.encoder_layers): 
+                    self.distiller.encoder.layers[l].load_state_dict(
+                        self.disc_teacher.model.encoder.layers[l].state_dict()
+                    )
+            else:
+                raise Exception("Invalid init model type!")
 
         # freeze the label embedding
-        if hasattr(self.teacher.model, 'label_embs_concat'):
-            self.teacher.model.label_embs_concat.requires_grad = False
+        if hasattr(self.reg_teacher.model, 'label_embs_concat'):
+            self.reg_teacher.model.label_embs_concat.requires_grad = False
+        if hasattr(self.disc_teacher.model, 'label_embs_concat'):
+            self.disc_teacher.model.label_embs_concat.requires_grad = False
 
         # decode
         self.steps = 0
@@ -347,25 +383,26 @@ class DistillerForPretrain(nn.Module):
         with torch.no_grad():
             wave_orig = [wave.to(wave_input.device) for wave in wave_orig]
             with torch.cuda.amp.autocast(False):
-                teacher_hiddens = self.teacher(wave_orig)
+                reg_teacher_hiddens = self.reg_teacher(wave_orig)
+                disc_teacher_hiddens = self.disc_teacher(wave_orig)
                 # get the embeddings
-                teacher_logits = teacher_hiddens["hidden_states"][-1] # B x T x C
-                if hasattr(self.teacher.model, 'get_embeddings'):
-                    teacher_embeddings = self.teacher.model.get_embeddings(teacher_logits)
+                disc_teacher_logits = disc_teacher_hiddens["hidden_states"][-1] # B x T x C
+                if hasattr(self.disc_teacher.model, 'get_embeddings'):
+                    disc_teacher_embeddings = self.disc_teacher.model.get_embeddings(disc_teacher_logits)
                 else:
-                    teacher_embeddings = None
+                    disc_teacher_embeddings = None
             if self.config.task_emb_type == "none":
-                teacher_hiddens = teacher_hiddens["hidden_states"][self.config.n_tasks]
-                teacher_hiddens = teacher_hiddens.unsqueeze(1)
+                reg_teacher_hiddens = reg_teacher_hiddens["hidden_states"][self.config.n_tasks]
+                reg_teacher_hiddens = reg_teacher_hiddens.unsqueeze(1)
             else:
                 if self.config.task_emb_type in ["expand-last", "hnet", "self-hidden", "layer-wise"]:
-                    teacher_hiddens = [
-                        teacher_hiddens["hidden_states"][i]
+                    reg_teacher_hiddens = [
+                        reg_teacher_hiddens["hidden_states"][i]
                         for i in self.distiller.pred_layer_id
                     ]
                 else:
-                    teacher_hiddens = teacher_hiddens["hidden_states"][1:]
-                teacher_hiddens = torch.stack(teacher_hiddens, dim=1)  # B x N x T x D
+                    reg_teacher_hiddens = reg_teacher_hiddens["hidden_states"][1:]
+                reg_teacher_hiddens = torch.stack(reg_teacher_hiddens, dim=1)  # B x N x T x D
 
         (
             total_loss,
@@ -375,7 +412,7 @@ class DistillerForPretrain(nn.Module):
             sim_loss,
             sim_layer_loss,
             emb_loss
-        ) = self.compute_loss(feat, pred, teacher_hiddens, teacher_embeddings, student_embeddings, return_other) #! feat [12, 752, 512]  pred [12, 2, 752, 768]  teacher_hiddens [12, 2, 752, 768]
+        ) = self.compute_loss(feat, pred, reg_teacher_hiddens, disc_teacher_embeddings, student_embeddings, return_other) #! feat [12, 752, 512]  pred [12, 2, 752, 768]  teacher_hiddens [12, 2, 752, 768]
 
         wandb.log({
             "total_loss": total_loss,
@@ -391,45 +428,7 @@ class DistillerForPretrain(nn.Module):
         #     wandb.log({f"sim_layer_loss_{i}":item})
         
         return_other = False
-
-        if return_other:
-            with torch.no_grad():
-                other_res = {
-                    "rec_loss": rec_loss,
-                    "feat_pen": feat_pen,
-                    "sim_loss": sim_loss,
-                    "norm_feat_final": feat_final.pow(2).mean(),
-                }
-                teacher_norm = torch.abs(teacher_hiddens).mean((0, 2, 3))
-                if self.config.task_emb_type == "none":
-                    other_res[f"rec_l{self.config.n_tasks}"] = rec_layer_loss[0]
-                    other_res[f"tar_norm_l{self.config.n_tasks}"] = teacher_norm[0]
-                    if sim_layer_loss is not None:
-                        other_res[f"sim_l{self.config.n_tasks}"] = sim_layer_loss[0]
-                else:
-                    for i in range(self.config.n_tasks):
-                        layer_id = i + 1
-                        if self.config.task_emb_type in [
-                            "expand-last",
-                            "hnet",
-                            "self-hidden",
-                        ]:
-                            layer_id = self.distiller.pred_layer_id[i]
-                        other_res[f"rec_l{layer_id}"] = rec_layer_loss[i]
-                        other_res[f"tar_norm_l{layer_id}"] = teacher_norm[i]
-                        if sim_layer_loss is not None:
-                            other_res[f"sim_l{layer_id}"] = sim_layer_loss[i]
-                    if self.config.task_emb_type not in [
-                        "expand-last",
-                        "hnet",
-                        "self-hidden",
-                    ]:
-                        other_res[
-                            "norm_task_emb"
-                        ] = self.distiller.task_embedding.weight.pow(2).mean()
-        else:
-            other_res = None
-
+        other_res = None
         return total_loss, other_res
 
     def compute_loss(self, feat, pred, target, teacher_embeddings, student_embeddings, return_other=False):
@@ -475,7 +474,7 @@ class DistillerForPretrain(nn.Module):
             teacher_embeddings = teacher_embeddings.view(embedding_size[0] * embedding_size[1], embedding_size[2]) # BT x 256
 
             with torch.no_grad():
-                label_embs = self.teacher.model.label_embs_concat
+                label_embs = self.disc_teacher.model.label_embs_concat
                 label_embs_teacher = label_embs.unsqueeze(1).expand(-1, teacher_embeddings.size(0), -1) # [504, b*t, 256]
                 teacher_embedding_logits = torch.cosine_similarity(teacher_embeddings.float(), label_embs_teacher.float(), dim=-1).type_as(teacher_embeddings)
                 teacher_embedding_logits = teacher_embedding_logits.transpose(0, 1) # [b*t, 504]
